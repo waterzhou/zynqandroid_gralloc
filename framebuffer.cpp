@@ -55,6 +55,11 @@ struct fb_context_t {
     framebuffer_device_t  device;
 };
 
+//static int override_xres = 800;
+static int override_xres = 1280;
+//static int override_yres = 400;
+static int override_yres = 720;
+
 /*****************************************************************************/
 
 static int fb_setSwapInterval(struct framebuffer_device_t* dev,
@@ -93,7 +98,7 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
     private_module_t* m = reinterpret_cast<private_module_t*>(
             dev->common.module);
 
-    if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER) {
+    if (0 && (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)) {
         const size_t offset = hnd->base - m->framebuffer->base;
         m->info.activate = FB_ACTIVATE_VBL;
         m->info.yoffset = offset / m->finfo.line_length;
@@ -112,16 +117,40 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
         void* buffer_vaddr;
         
         m->base.lock(&m->base, m->framebuffer, 
-                GRALLOC_USAGE_SW_WRITE_RARELY, 
-                0, 0, m->info.xres, m->info.yres,
-                &fb_vaddr);
+                     GRALLOC_USAGE_SW_WRITE_RARELY, 
+                     0, 0, m->info.xres, m->info.yres,
+                     &fb_vaddr);
 
         m->base.lock(&m->base, buffer, 
-                GRALLOC_USAGE_SW_READ_RARELY, 
-                0, 0, m->info.xres, m->info.yres,
-                &buffer_vaddr);
+                     GRALLOC_USAGE_SW_READ_RARELY, 
+                     0, 0, m->info.xres, m->info.yres,
+                     &buffer_vaddr);
 
-        memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+        char *dst_vaddr = (char*)fb_vaddr;
+        char *src_vaddr = (char*)buffer_vaddr;
+        size_t src_row_bytes = override_xres * (m->info.bits_per_pixel >> 3);
+        if (0)
+        ALOGI("%s:%d line_length=%d size=%d smem_len=%d src_row_bytes=%d\n",
+              __FILE__, __LINE__,
+              m->finfo.line_length,
+              m->finfo.line_length * override_yres,
+              m->finfo.smem_len,
+              src_row_bytes);
+
+        if (0) {
+            memcpy(dst_vaddr, buffer_vaddr, m->finfo.smem_len);
+        } else {
+            for (int row = 0; row < override_yres; row++) {
+                if (0)
+                ALOGI("%s:%d row=%d dst_vaddr=%p src_vaddr=%p\n",
+                      __FILE__, __LINE__,
+                      row,
+                      dst_vaddr, src_vaddr);
+                memcpy(dst_vaddr, src_vaddr, src_row_bytes);
+                dst_vaddr += m->finfo.line_length;
+                src_vaddr += src_row_bytes;
+            };
+        }
         
         m->base.unlock(&m->base, buffer); 
         m->base.unlock(&m->base, m->framebuffer); 
@@ -174,23 +203,33 @@ int mapFrameBufferLocked(struct private_module_t* module)
     /*
      * Request NUM_BUFFERS screens (at lest 2 for page flipping)
      */
-    info.yres_virtual = info.yres * NUM_BUFFERS;
-
+    //info.xres = info.xres_virtual / 2;
+    //info.yres = info.yres_virtual / 2;
+    //info.xres_virtual = info.xres;
+    info.yres_virtual = info.yres * 1; //NUM_BUFFERS;
 
     uint32_t flags = PAGE_FLIP;
-    if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) {
-        info.yres_virtual = info.yres;
+    if ((ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) || 1) {
+        //info.yres_virtual = info.yres;
         flags &= ~PAGE_FLIP;
         ALOGW("FBIOPUT_VSCREENINFO failed, page flipping not supported");
+    } else {
+        ALOGI("page flipping seems to be supported");
     }
 
     if (info.yres_virtual < info.yres * 2) {
         // we need at least 2 for page-flipping
-        info.yres_virtual = info.yres;
+        //info.yres_virtual = info.yres;
         flags &= ~PAGE_FLIP;
         ALOGW("page flipping not supported (yres_virtual=%d, requested=%d)",
-                info.yres_virtual, info.yres*2);
+              info.yres_virtual, info.yres*2);
+    } else {
+        ALOGI("page flipping seems to be supported (yres_virtual=%d, requested=%d)",
+              info.yres_virtual, info.yres*2);
     }
+
+    //override_xres = info.xres;
+    //override_yres = info.yres;
 
     if (ioctl(fd, FBIOGET_VSCREENINFO, &info) == -1)
         return -errno;
@@ -272,15 +311,16 @@ int mapFrameBufferLocked(struct private_module_t* module)
      */
 
     int err;
-    size_t fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
+    size_t fbSize = roundUpToPageSize(finfo.smem_len);
     module->framebuffer = new private_handle_t(dup(fd), fbSize, 0);
 
-    module->numBuffers = info.yres_virtual / info.yres;
+    // calculate from smem_len / (yres_vsize * xres_vsize * bits_per_pixel/8)
+    module->numBuffers = 1; //info.yres_virtual / info.yres;
     module->bufferMask = 0;
 
     void* vaddr = mmap(0, fbSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (vaddr == MAP_FAILED) {
-        ALOGE("Error mapping the framebuffer (%s)", strerror(errno));
+        ALOGE("Error mapping the framebuffer shared (%s)", strerror(errno));
         return -errno;
     }
     module->framebuffer->base = intptr_t(vaddr);
@@ -312,6 +352,11 @@ int fb_device_open(hw_module_t const* module, const char* name,
 {
     int status = -EINVAL;
     if (!strcmp(name, GRALLOC_HARDWARE_FB0)) {
+        alloc_device_t* gralloc_device;
+        status = gralloc_open(module, &gralloc_device);
+        if (status < 0)
+            return status;
+
         /* initialize our state here */
         fb_context_t *dev = (fb_context_t*)malloc(sizeof(*dev));
         memset(dev, 0, sizeof(*dev));
@@ -333,8 +378,8 @@ int fb_device_open(hw_module_t const* module, const char* name,
                          ? HAL_PIXEL_FORMAT_RGBX_8888
                          : HAL_PIXEL_FORMAT_RGB_565;
             const_cast<uint32_t&>(dev->device.flags) = 0;
-            const_cast<uint32_t&>(dev->device.width) = m->info.xres;
-            const_cast<uint32_t&>(dev->device.height) = m->info.yres;
+            const_cast<uint32_t&>(dev->device.width) = override_xres;
+            const_cast<uint32_t&>(dev->device.height) = override_yres;
             const_cast<int&>(dev->device.stride) = stride;
             const_cast<int&>(dev->device.format) = format;
             const_cast<float&>(dev->device.xdpi) = m->xdpi;
